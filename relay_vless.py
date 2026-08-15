@@ -17,10 +17,12 @@ from main import (
     error_logs,
     logger,
     is_link_allowed,
+    is_ip_allowed,
     save_state,
     log_activity,
     now_ir,
 )
+from speed_limit import throttle
 
 # ══════════════════════════════════════════════════════════════════════════════
 # VLESS Relay — بهینه‌شده برای حداکثر throughput
@@ -82,6 +84,7 @@ async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, conn_id: 
             if not await check_and_use(uid, len(data)):
                 await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
+            await throttle(uid, len(data))
             stats["total_requests"] += 1
             connections[conn_id]["bytes"] += len(data)
             writer.write(data)
@@ -105,6 +108,7 @@ async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: 
             if not await check_and_use(uid, len(data)):
                 await ws.close(code=1008, reason="quota/disabled/unknown")
                 break
+            await throttle(uid, len(data))
             connections[conn_id]["bytes"] += len(data)
             payload = (b"\x00\x00" + data) if first else data
             first = False
@@ -124,6 +128,13 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         return
 
     ip = _ws_client_ip(ws)
+
+    if not is_ip_allowed(link, uuid, ip):
+        logger.warning(f"🚫 WS rejected uuid={uuid[:8]}… ip={ip} (ip limit reached)")
+        log_activity("connection", f"اتصال {ip} به کانفیگ «{link.get('label','?')}» رد شد (محدودیت تعداد آی‌پی)", "warn")
+        await ws.close(code=1008, reason="ip limit reached")
+        return
+
     conn_id = secrets.token_urlsafe(6)
     connections[conn_id] = {
         "uuid": uuid,

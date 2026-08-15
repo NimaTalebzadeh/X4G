@@ -1,6 +1,10 @@
 # xhttp_siz10.py
 # ══════════════════════════════════════════════════════════════════════════════
-# Siz10a · XHTTP Ultra Transport — دو مد: packet-up / stream-up
+# Siz10a · XHTTP Ultra Transport — مود auto (packet-up / stream-up)
+#  مسیر سرور دیگه به مود بستگی نداره (مطابق رفتار واقعی mode=auto در Xray):
+#  کلاینت خودش بر اساس نوع اتصال (H2/REALITY یا نه) بین packet-up و
+#  stream-up انتخاب می‌کنه، و مود واقعی فقط از روی شکل درخواست POST
+#  (وجود یا عدم وجود seq در انتهای مسیر) روی سرور تشخیص داده می‌شه.
 #  (stream-one حذف شد. منطق relay_vless دست‌نخورده.
 #   stream-up بازنویسی شده با موتور تطبیقی: _AdaptiveFlow (AIMD روی high-water)
 #   + _QuotaGate تطبیقی (batch بر اساس نرخ واقعی هر سشن) + سوکت تیون‌شده)
@@ -24,9 +28,11 @@ from main import (
     error_logs,
     logger,
     is_link_allowed,
+    is_ip_allowed,
     save_state,
 )
 from relay_vless import parse_vless_header, check_and_use
+from speed_limit import throttle
 
 router = APIRouter()
 
@@ -202,6 +208,13 @@ async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str 
         if sess is not None:
             sess["last_seen"] = time.time()
             return sess
+
+        async with LINKS_LOCK:
+            link = LINKS.get(uuid)
+        if not is_ip_allowed(link, uuid, ip):
+            logger.warning(f"🚫 XHTTP[{mode}] rejected uuid={uuid[:8]} ip={ip} (ip limit reached)")
+            raise HTTPException(status_code=403, detail="ip limit reached")
+
         conn_id = secrets.token_urlsafe(6)
         connections[conn_id] = {
             "uuid": uuid,
@@ -223,6 +236,18 @@ async def _get_or_create_session(uuid: str, mode: str, session_id: str, ip: str 
         xhttp_sessions[session_id] = sess
         logger.info(f"new XHTTP[{mode}] session [{session_id[:8]}] uuid={uuid[:8]} ip={ip}")
         return sess
+
+
+async def _mark_real_mode(session_id: str, sess: dict, real_mode: str):
+    """وقتی سشن با مود 'auto' ساخته شده، اولین درخواست POST واقعی مشخص می‌کنه
+    که کلاینت در عمل packet-up انتخاب کرده یا stream-up؛ همون‌جا برچسب سشن و
+    اتصال نمایشی رو به‌روز می‌کنیم تا در بخش «اتصالات» درست دیده بشه."""
+    if sess.get("mode") == real_mode:
+        return
+    sess["mode"] = real_mode
+    conn = connections.get(sess.get("conn_id"))
+    if conn:
+        conn["transport"] = f"xhttp-{real_mode}"
 
 
 async def _teardown(session_id: str):
@@ -287,6 +312,7 @@ async def _pump_tcp_to_queue(session_id: str, uuid: str, reader: asyncio.StreamR
                 break
             if not await gate.add(len(data)):
                 break
+            await throttle(uuid, len(data))
             async with XHTTP_LOCK:
                 sess = xhttp_sessions.get(session_id)
             if sess:
@@ -329,15 +355,13 @@ def _downstream_gen(sess: dict):
     return gen()
 
 
-# ══════════════════════════════ GET دانلینک (مشترک بین سه مد) ══════════════════════════════
-@router.get("/xhttp-siz10/{mode}/{uuid}/{session_id}")
-async def xhttp_downlink(mode: str, uuid: str, session_id: str, request: Request):
+# ══════════════════════════════ GET دانلینک (مشترک بین دو مد، بدون وابستگی به مود) ══════════════════════════════
+@router.get("/xhttp-siz10/{uuid}/{session_id}")
+async def xhttp_downlink(uuid: str, session_id: str, request: Request):
     ensure_reaper()
-    if mode not in ("packet-up", "stream-up"):
-        raise HTTPException(status_code=404, detail="unknown mode")
     await _check_link(uuid)
     fp = request.query_params.get("fp", DEFAULT_FINGERPRINT)
-    sess = await _get_or_create_session(uuid, mode, session_id, _req_client_ip(request))
+    sess = await _get_or_create_session(uuid, "auto", session_id, _req_client_ip(request))
     if sess.get("closed"):
         raise HTTPException(status_code=404, detail="session closed")
 
@@ -346,10 +370,11 @@ async def xhttp_downlink(mode: str, uuid: str, session_id: str, request: Request
 
 
 # ══════════════════════════════ PACKET-UP (آپلینک با seq) ══════════════════════════════
-@router.post("/xhttp-siz10/packet-up/{uuid}/{session_id}/{seq}")
+@router.post("/xhttp-siz10/{uuid}/{session_id}/{seq}")
 async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Request):
     ensure_reaper()
     sess = await _get_or_create_session(uuid, "packet-up", session_id, _req_client_ip(request))
+    await _mark_real_mode(session_id, sess, "packet-up")
     if sess.get("closed"):
         raise HTTPException(status_code=404, detail="session closed")
 
@@ -361,6 +386,7 @@ async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Reques
     if not await check_and_use(uuid, len(body)):
         await _teardown(session_id)
         raise HTTPException(status_code=403, detail="quota/disabled/unknown")
+    await throttle(uuid, len(body))
 
     stats["total_requests"] += 1
     connections[sess["conn_id"]]["bytes"] += len(body)
@@ -406,10 +432,11 @@ async def packet_up_upload(uuid: str, session_id: str, seq: int, request: Reques
 # موتور تطبیقی: _QuotaGate (batch کوتا بر اساس نرخ واقعی) + _AdaptiveFlow (AIMD روی
 # high-water درین) + کش رفرنس‌ها داخل لوپ. هیچ داده‌ای بافر/coalesce نمی‌شه —
 # هر بایت فوری write() می‌شه، فقط «کِی صبر کنیم برای drain» تطبیقیه.
-@router.post("/xhttp-siz10/stream-up/{uuid}/{session_id}")
+@router.post("/xhttp-siz10/{uuid}/{session_id}")
 async def stream_up_upload(uuid: str, session_id: str, request: Request):
     ensure_reaper()
     sess = await _get_or_create_session(uuid, "stream-up", session_id, _req_client_ip(request))
+    await _mark_real_mode(session_id, sess, "stream-up")
     if sess.get("closed"):
         raise HTTPException(status_code=404, detail="session closed")
 
@@ -434,6 +461,7 @@ async def stream_up_upload(uuid: str, session_id: str, request: Request):
 
             if not await gate.add(len(chunk)):
                 raise HTTPException(status_code=403, detail="quota/disabled/unknown")
+            await throttle(uuid, len(chunk))
 
             stats["total_requests"] += 1
             conn["bytes"] += len(chunk)
